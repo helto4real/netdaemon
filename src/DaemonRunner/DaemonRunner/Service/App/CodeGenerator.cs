@@ -2,15 +2,15 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text.RegularExpressions;
 using JoySoftware.HomeAssistant.Client;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
-using NetDaemon.Common;
-using NetDaemon.Common.Exceptions;
 using NetDaemon.Common.Reactive;
 using NetDaemon.Common.Reactive.Services;
 using NetDaemon.Daemon.Config;
+using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
 
 [assembly: InternalsVisibleTo("NetDaemon.Daemon.Tests")]
 
@@ -18,104 +18,194 @@ namespace NetDaemon.Service.App
 {
     public static class CodeGenerator
     {
-        private static readonly Dictionary<string, string[]> _skipDomainServices = new Dictionary<string, string[]>()
+        // todo: skip these methods that are allready on the base class
+        private static readonly Dictionary<string, string[]> _skipDomainServices = GetExisitingServices();
+
+        public static Dictionary<string, string[]> GetExisitingServices()
         {
-            {"lock", new[] {"lock", "unlock", "open"}},
-            {"light", new[] {"turn_on", "turn_off", "toggle"}},
-            {"script", new[] {"reload"}},
-            {"automation", new[] {"turn_on", "turn_off", "toggle", "trigger", "reload"}},
-            {"binary_sensor", new[] {"turn_on", "turn_off", "toggle"}},
+            var rxEntityBaseTypeInfo = typeof(RxEntityBase);
+            var derived = rxEntityBaseTypeInfo.Assembly.DefinedTypes.Where(t => t.IsAssignableTo(rxEntityBaseTypeInfo));
+            return derived.ToDictionary(d => d.Name, d => d.GetMethods().Select(m => m.Name).ToArray());
+        }
+
+        public static string GenerateCodeRx(string nameSpace, IReadOnlyCollection<string> entities,
+            IReadOnlyCollection<HassServiceDomain> serviceDomains)
+        {
+            var entityDomains = GetDomainsFromEntities(entities).OrderBy(s => s).ToList();
+            var serviceDomainsWithOperations =
+                serviceDomains.Where(sd => sd.Services?.Any(s => !HasEntityIdArgument(s)) == true);
+
+            var allDomains = entityDomains.Union(serviceDomainsWithOperations.Select(sd => sd.Domain)).OfType<string>()
+                .OrderBy(s => s).ToList();
+
+            var code = CompilationUnit()
+                       .AddUsings(UsingDirective(ParseName("System.Collections.Generic")))
+                       .AddUsings(UsingDirective(ParseName(typeof(RxEntityBase).Namespace!)))
+                       .AddUsings(UsingDirective(ParseName(typeof(NetDaemonRxApp).Namespace!)));
+
+           var namespaceDeclaration = NamespaceDeclaration(ParseName(nameSpace)).NormalizeWhitespace();
+
+           // One Base class
+           var appBaseClassDeclaration = GenerateAppBaseClass(allDomains);
+
+            namespaceDeclaration = namespaceDeclaration.AddMembers(appBaseClassDeclaration);
+
+            var serviceDomainByName = serviceDomains.ToLookup(sd => sd.Domain);
+
+            // Typed entity classes
+            foreach (var entityDomain in entityDomains)
             {
-                "camera",
-                new[]
-                {
-                    "turn_on", "turn_off", "toggle", "enable_motion_detection", "disable_motion_detection",
-                    "play_stream", "record", "snapshot"
-                }
-            },
-            {
-                "climate",
-                new[]
-                {
-                    "turn_on", "turn_off", "toggle", "set_aux_heat", "set_preset_mode", "set_temperature",
-                    "set_humidity", "set_fan_mode", "set_hvac_mode", "set_swing_mode"
-                }
-            },
-            {
-                "cover",
-                new[]
-                {
-                    "open_cover", "close_cover", "stop_cover", "toggle", "open_cover_tilt", "close_cover_tilt",
-                    "stop_cover_tilt", "set_cover_position", "set_cover_tilt_position", "toggle_cover_tilt"
-                }
-            },
-            {"device_tracker", new[] {"see"}},
-            {"group", new[] {"reload", "set", "remove"}},
-            {"image_processing", new[] {"scan"}},
-            {"input_boolean", new[] {"turn_on", "turn_off", "toggle", "reload"}},
-            {
-                "media_player",
-                new[]
-                {
-                    "turn_on", "turn_off", "toggle", "volume_up", "volume_down", "volume_set", "volume_mute",
-                    "media_play_pause", "media_play", "media_pause", "media_stop", "media_next_track",
-                    "media_previous_track", "clear_playlist", "shuffle_set", "repeat_set", "play_media",
-                    "select_source", "select_sound_mode", "media_seek"
-                }
-            },
-            {"person", new[] {"reload"}},
-            {"zone", new[] {"reload"}},
-            {"scene", new[] {"reload", "apply", "create", "turn_on"}},
-            {"sensor", new[] {"turn_on", "turn_off", "toggle"}},
-            {"persistent_notification", new[] {"create", "dismiss", "mark_read"}},
-            {"sun", new string[0]},
-            {"weather", new string[0]},
-            {"switch", new[] {"turn_on", "turn_off", "toggle"}},
-            {
-                "vacuum",
-                new[]
-                {
-                    "turn_on", "turn_off", "start_pause", "start", "pause", "stop", "return_to_base", "locate",
-                    "clean_spot", "set_fan_speed", "send_command", "toggle"
-                }
-            },
-            {
-                "alarm_control_panel",
-                new[]
-                {
-                    "alarm_arm_home", "alarm_disarm", "alarm_arm_away", "alarm_arm_night", "alarm_arm_custom_bypass",
-                    "alarm_trigger"
-                }
+                var entityClass = GenerateEntityClass(entityDomain, serviceDomainByName[entityDomain].FirstOrDefault());
+
+                namespaceDeclaration = namespaceDeclaration.AddMembers(entityClass);
             }
-        };
 
-        public static string? GenerateCodeRx(string nameSpace, IEnumerable<string> entities,
-            IEnumerable<HassServiceDomain> services)
+            // Domain classes
+            foreach (var entityDomain in allDomains)
+            {
+                var entityClass = GenerateDomainClass(entityDomain, serviceDomainByName[entityDomain].FirstOrDefault(), entities);
+
+                namespaceDeclaration = namespaceDeclaration.AddMembers(entityClass);
+            }
+
+            code = code.AddMembers(namespaceDeclaration);
+
+            return code.NormalizeWhitespace(indentation: "    ", eol: "\n").ToFullString();
+        }
+
+        private static ClassDeclarationSyntax GenerateDomainClass(string domainName, HassServiceDomain? serviceDomain, IEnumerable<string> entities)
         {
-            var code = SyntaxFactory.CompilationUnit();
 
-            // Add Usings statements
-            code = code.AddUsings(SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Collections.Generic")));
-            code = code.AddUsings(
-                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(typeof(RxEntityBase).Namespace!)));
-            code = code.AddUsings(
-                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(typeof(NetDaemonRxApp).Namespace!)));
+            var classDeclaration = $@"public partial class {domainName.ToCamelCase()}Entities
+                                      {{
+                                          private readonly {nameof(NetDaemonRxApp)} _app;
 
-            // Add namespace
-            var namespaceDeclaration = SyntaxFactory.NamespaceDeclaration(SyntaxFactory.ParseName(nameSpace))
-                .NormalizeWhitespace();
+                                          public {domainName.ToCamelCase()}Entities( {nameof(NetDaemonRxApp)} app)
+                                          {{
+                                              _app = app;
+                                          }}
+                                      }}";
 
-            // Add support for extensions for entities
-            var extensionClass = SyntaxFactory.ClassDeclaration("GeneratedAppBase");
+            var entityClassDeclaration = Parse<ClassDeclarationSyntax>(classDeclaration);
 
-            extensionClass = extensionClass.AddModifiers(SyntaxFactory.Token(SyntaxKind.PublicKeyword));
+            var domainEntities = entities.Where(n => n.StartsWith(domainName + ".", StringComparison.InvariantCultureIgnoreCase)).ToList();
+
+            var propertyDeclaration = domainEntities.Select(e => GenerateEntityProperty(e, domainName)).ToArray();
+
+            entityClassDeclaration = entityClassDeclaration.AddMembers(propertyDeclaration);
+
+            var usedNames = propertyDeclaration.Select(p => p.Identifier.Text).ToHashSet();
+
+            // Generate methods for all services that do not require an entity ID
+            if (serviceDomain?.Services is null) return entityClassDeclaration;
+
+            var nonEntityMethods = serviceDomain.Services.Where(s => !HasEntityIdArgument(s)).SelectMany(s =>
+                GenerateServiceMethods(domainName, s, usedNames, "_app."));
+
+            entityClassDeclaration = entityClassDeclaration.AddMembers(nonEntityMethods.ToArray());
+
+            return entityClassDeclaration;
+        }
+
+        private static T Parse<T>(string text) =>  CSharpSyntaxTree.ParseText(text).GetRoot().ChildNodes().OfType<T>().First();
+
+        /// <summary>
+        /// Generate property to get type entity
+        /// </summary>
+        /// <returns></returns>
+        private static PropertyDeclarationSyntax GenerateEntityProperty(string entity, string domain)
+        {
+            // public SwitchEntity LivingRoomSwitch => new(_app, new string[] { "switch.living_room_switch" });
+
+            var name = entity[(entity.IndexOf(".", StringComparison.InvariantCultureIgnoreCase) + 1)..];
+            name = MakeValidName(name, null, "e_", null);
+
+            var propertyCode =  $@"public {domain.ToCamelCase()}Entity {name.ToCamelCase()} => new(_app, new string[] {{""{entity}""}});";
+
+            var propDeclaration = Parse<PropertyDeclarationSyntax>(propertyCode);
+
+            return propDeclaration;
+        }
+
+        private static ClassDeclarationSyntax GenerateEntityClass(string domainName, HassServiceDomain? serviceDomain)
+        {
+            var baseClass = _skipDomainServices.ContainsKey(domainName)
+                ? $"{typeof(RxEntityBase).Namespace}.{domainName.ToCamelCase()}Entity"
+                : $"{typeof(RxEntityBase).Namespace}.RxEntityBase";
+
+            var classDeclaration = $@"  public partial class {domainName.ToCamelCase()}Entity : {baseClass}
+                                        {{
+                                                public {domainName.ToCamelCase()}Entity(INetDaemonRxApp daemon, IEnumerable<string> entityIds) : base(daemon, entityIds)
+                                                {{
+                                                }}
+                                            }}";
+
+            var entityClass = Parse<ClassDeclarationSyntax>(classDeclaration);
+
+            // Generate methods for all services that do require an entity ID
+            if (serviceDomain?.Services is null) return entityClass;
+
+            var nonEntityMethods = serviceDomain.Services.Where(HasEntityIdArgument).SelectMany(s =>
+                GenerateServiceMethods(domainName, s, new()));
+
+            entityClass = entityClass.AddMembers(nonEntityMethods.ToArray());
+
+            return entityClass;
+        }
+
+        private static IEnumerable<MemberDeclarationSyntax> GenerateServiceMethods(string domain, HassService service, HashSet<string> usedNames, string callPrefix = "")
+        {
+            var serviceMethodName = service.Service?[(service.Service.IndexOf(".", StringComparison.InvariantCultureIgnoreCase) + 1)..];
+
+            List<MemberDeclarationSyntax> result = new();
+
+            serviceMethodName = MakeValidName(serviceMethodName!, usedNames, "s_", "Service");
+
+            var argumentsRecord = GenerateServiceArgsRecord(serviceMethodName, service);
+            var argsTypeName = argumentsRecord.Identifier.Text;
+
+            var hasEntityId = HasEntityIdArgument(service);
+            var hasEntityIdString = hasEntityId ? "true" : "false";
+            var methodCode = $@"public void {serviceMethodName}({argsTypeName}? data=null)
+                                {{
+                                    {callPrefix}CallService(""{domain}"", ""{service.Service}"", data,{hasEntityIdString});
+                                }}";
+
+            var methodDeclaration = Parse<GlobalStatementSyntax>(methodCode);
+
+            result.Add(methodDeclaration);
+
+            if (service.Fields?.Count() == (hasEntityId ? 2 : 1))
+            {
+                var paramName = service.Fields.Single(f => f.Field != "entity_id").Field;
+
+                // We have a single prop besides the id, generate a simple wrapper method with one argument
+                var methodCode2 = $@"public void {serviceMethodName}(string {paramName})
+                                     {{
+                                         {callPrefix}CallService(""{domain}"", ""{service.Service}"", new {{ {paramName} = {paramName} }} ,{hasEntityIdString});
+                                     }}";
+
+                var methodDeclaration2 = Parse<GlobalStatementSyntax>(methodCode2);
+
+                result.Add(methodDeclaration2);
+            }
+
+            result.Add(argumentsRecord);
+
+            return result;
+        }
+
+        private static ClassDeclarationSyntax GenerateAppBaseClass(IEnumerable<string> domains)
+        {
+            var extensionClass = ClassDeclaration("GeneratedAppBase");
+
+            extensionClass = extensionClass.AddModifiers(Token(SyntaxKind.PublicKeyword));
             extensionClass = extensionClass.AddBaseListTypes(
-                SyntaxFactory.SimpleBaseType(SyntaxFactory.ParseTypeName(nameof(NetDaemonRxApp))));
+                SimpleBaseType(ParseTypeName(nameof(NetDaemonRxApp))));
 
-            // Get all available domains, this is used to create the extensionmethods
-            var domains = GetDomainsFromEntities(entities);
+            // Get all available domains, this is used to create the extension methods
 
-            var singleServiceDomains = new string[] { "script" };
+            var singleServiceDomains = new [] {"script"};
             foreach (var domain in domains)
             {
                 var camelCaseDomain = domain.ToCamelCase();
@@ -126,128 +216,61 @@ namespace NetDaemon.Service.App
                     ? $"public {camelCaseDomain}Entities {camelCaseDomain} => new(this);"
                     : $@"public {camelCaseDomain}Entity {camelCaseDomain} => new(this, new string[] {{""""}});";
 
-                var propertyDeclaration = CSharpSyntaxTree.ParseText(property).GetRoot().ChildNodes()
-                                              .OfType<PropertyDeclarationSyntax>().FirstOrDefault()
-                                          ?? throw new NetDaemonNullReferenceException(
-                                              $"Parse of property {camelCaseDomain} Entities/Entity failed");
+                var propertyDeclaration = Parse<PropertyDeclarationSyntax>(property);
                 extensionClass = extensionClass.AddMembers(propertyDeclaration);
             }
 
-            namespaceDeclaration = namespaceDeclaration.AddMembers(extensionClass);
-
-            foreach (var domain in GetDomainsFromEntities(entities))
-            {
-                if (!ShouldGenerateDomainEntity(domain, services)) continue;
-                var baseClass = _skipDomainServices.ContainsKey(domain)
-                    ? $"{typeof(RxEntityBase).Namespace}.{domain.ToCamelCase()}Entity"
-                    : $"{typeof(RxEntityBase).Namespace}.RxEntityBase";
-
-                var classDeclaration = $@"public partial class {domain.ToCamelCase()}Entity : {baseClass}
-{{
-        public {domain.ToCamelCase()}Entity(INetDaemonRxApp daemon, IEnumerable<string> entityIds) : base(daemon, entityIds)
-        {{
-        }}
-    }}";
-                var entityClass = CSharpSyntaxTree.ParseText(classDeclaration).GetRoot().ChildNodes()
-                                      .OfType<ClassDeclarationSyntax>().FirstOrDefault()
-                                  ?? throw new NetDaemonNullReferenceException("Failed to parse class declaration");
-
-                // They already have default implementation
-                var skipServices = new string[] { "turn_on", "turn_off", "toggle" };
-
-                foreach (var s in services.Where(n => n.Domain == domain)
-                    .SelectMany(n => n.Services ?? new List<HassService>()))
-                {
-                    if (s.Service is null)
-                        continue;
-
-                    var name = s.Service[(s.Service.IndexOf(".", StringComparison.InvariantCultureIgnoreCase) + 1)..];
-
-                    if (Array.IndexOf(skipServices, name) >= 0)
-                        continue;
-
-                    if (_skipDomainServices.ContainsKey(domain) && _skipDomainServices[domain].Contains(name))
-                        continue;
-
-                    // Quick check to make sure the name is a valid C# identifier. Should really check to make
-                    // sure it doesn't collide with a reserved keyword as well.
-                    if (!char.IsLetter(name[0]) && (name[0] != '_'))
-                    {
-                        name = "s_" + name;
-                    }
-
-                    var hasEntityId = s.Fields is not null && s.Fields.Any(c => c.Field == "entity_id");
-                    var hasEntityIdString = hasEntityId ? "true" : "false";
-                    var methodCode = $@"public void {name.ToCamelCase()}(dynamic? data=null)
-                    {{
-                        CallService(""{domain}"", ""{s.Service}"", data,{hasEntityIdString});
-                    }}
-                    ";
-                    var methodDeclaration = CSharpSyntaxTree.ParseText(methodCode).GetRoot().ChildNodes()
-                                                .OfType<GlobalStatementSyntax>().FirstOrDefault()
-                                            ?? throw new NetDaemonNullReferenceException("Failed to parse method");
-                    entityClass = entityClass.AddMembers(methodDeclaration);
-                }
-
-                namespaceDeclaration = namespaceDeclaration.AddMembers(entityClass);
-            }
-
-            // Add the classes implementing the specific entities
-            foreach (var domain in GetDomainsFromEntities(entities))
-            {
-                var classDeclaration = $@"public partial class {domain.ToCamelCase()}Entities
-    {{
-        private readonly {nameof(NetDaemonRxApp)} _app;
-
-        public {domain.ToCamelCase()}Entities( {nameof(NetDaemonRxApp)} app)
-        {{
-            _app = app;
-        }}
-    }}";
-                var entityClass = CSharpSyntaxTree.ParseText(classDeclaration).GetRoot().ChildNodes()
-                                      .OfType<ClassDeclarationSyntax>().FirstOrDefault()
-                                  ?? throw new NetDaemonNullReferenceException("Failed to parse entity class");
-                foreach (var entity in entities.Where(n =>
-                    n.StartsWith(domain, StringComparison.InvariantCultureIgnoreCase)))
-                {
-                    var name = entity[(entity.IndexOf(".", StringComparison.InvariantCultureIgnoreCase) + 1)..];
-                    // Quick check to make sure the name is a valid C# identifier. Should really check to make
-                    // sure it doesn't collide with a reserved keyword as well.
-                    if (!char.IsLetter(name[0]) && (name[0] != '_'))
-                    {
-                        name = "e_" + name;
-                    }
-
-                    var propertyCode =
-                        $@"public {domain.ToCamelCase()}Entity {name.ToCamelCase()} => new(_app, new string[] {{""{entity}""}});";
-                    var propDeclaration = CSharpSyntaxTree.ParseText(propertyCode).GetRoot().ChildNodes()
-                                              .OfType<PropertyDeclarationSyntax>().FirstOrDefault()
-                                          ?? throw new NetDaemonNullReferenceException("Failed to parse property");
-                    entityClass = entityClass.AddMembers(propDeclaration);
-                }
-
-                namespaceDeclaration = namespaceDeclaration.AddMembers(entityClass);
-            }
-
-            code = code.AddMembers(namespaceDeclaration);
-
-            return code.NormalizeWhitespace(indentation: "    ", eol: "\n").ToFullString();
+            return extensionClass;
         }
+
+        private static TypeDeclarationSyntax GenerateServiceArgsRecord(string name, HassService s)
+        {
+            var record = RecordDeclaration(Token(SyntaxKind.RecordKeyword), name + "Args")
+                .WithModifiers(TokenList(Token(SyntaxKind.PublicKeyword)))
+                .WithOpenBraceToken(Token(SyntaxKind.OpenBraceToken));
+
+            foreach (var field in s.Fields ?? Enumerable.Empty<HassServiceField>())
+            {
+                // TODO: make the prop camel case but serialize with original name
+                var propCode = //$"[JsonProperty(propertyName:{name})]" +
+                               $"public object {field.Field} {{ get; init; }}";
+
+                var prop = Parse<MemberDeclarationSyntax>(propCode);
+                record = record.AddMembers(prop);
+            }
+
+            record = record.WithCloseBraceToken(
+                Token(SyntaxKind.CloseBraceToken));
+            return record.NormalizeWhitespace();
+        }
+
+        private static bool HasEntityIdArgument(HassService service) => service.Fields?.Any(IsEntityId) == true;
+
+        private static bool IsEntityId(HassServiceField f) => f.Field == "entity_id";
 
         /// <summary>
         ///     Returns a list of domains from all entities
         /// </summary>
         /// <param name="entities">A list of entities</param>
         internal static IEnumerable<string> GetDomainsFromEntities(IEnumerable<string> entities) =>
-            entities.Select(n => n[0..n.IndexOf(".", StringComparison.InvariantCultureIgnoreCase)]).Distinct();
+            entities.Select(n => n[..n.IndexOf(".", StringComparison.InvariantCultureIgnoreCase)]).Distinct();
 
-        private static bool ShouldGenerateDomainEntity(string domain, IEnumerable<HassServiceDomain> services)
+        private static string MakeValidName(string name, HashSet<string>? usedNames, string prefix, string? suffix)
         {
-            if (!_skipDomainServices.ContainsKey(domain)) return true;
-            var domainServiceNames = services.Where(n => n.Domain == domain)
-                .SelectMany(n => n.Services ?? new List<HassService>()).Select(s =>
-                    s.Service![(s.Service.IndexOf(".", StringComparison.InvariantCultureIgnoreCase) + 1)..]);
-            return domainServiceNames.Except(_skipDomainServices[domain]).Any();
+            name = name.ToCamelCase();
+            name = Regex.Replace(name, @"[^\w]", "");
+
+            if (!char.IsLetter(name[0]) && (name[0] != '_'))
+            {
+                name = prefix + name;
+            }
+
+            if (usedNames !=null && !usedNames.Add(name))
+            {
+                name += suffix;
+            }
+
+            return name;
         }
     }
 }
